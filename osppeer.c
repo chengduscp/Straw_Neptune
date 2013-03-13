@@ -22,12 +22,55 @@
 #include <limits.h>
 #include "md5.h"
 #include "osp2p.h"
+#include <sys/wait.h>
 
 int evil_mode;			// nonzero iff this peer should behave badly
 
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
 
+// Helper functions
+int
+get_dir_depth(char *path)
+{
+	int start_pos, end_pos, depth;
+	printf("%s\n", path);
+
+	start_pos = end_pos = 0;
+	depth = 0;
+	while(path[start_pos] && path[end_pos]) {
+		int depth_change;
+		// Find the next directory entry
+		while(path[end_pos] && path[end_pos] != '/') {
+			end_pos++;
+		}
+
+		if(path[start_pos] == '/')
+			start_pos++;
+
+		// Check the directory/file
+		if(end_pos - start_pos == 1 &&
+				strncmp(&path[start_pos], ".", 1) == 0) {
+			// just same directory, no depth change
+			depth_change = 0;
+		}
+		else if(end_pos - start_pos == 2 &&
+				strncmp(&path[start_pos], "..", 2) == 0) {
+			// Going to parent file, losing depth
+			depth_change = -1;
+		}
+		else {
+			// Normal directory or file, depth 1
+			depth_change = 1;
+		}
+
+
+		depth += depth_change;
+		start_pos = end_pos;
+		end_pos++;
+	}
+	return depth;
+}
 
 /*****************************************************************************
  * TASK STRUCTURE
@@ -624,12 +667,16 @@ static task_t *task_listen(task_t *listen_task)
 }
 
 
+
+int g_parallel_flag = 0;
 // task_upload(t)
 //	Handles an upload request from another peer.
 //	First reads the request into the task buffer, then serves the peer
 //	the requested file.
 static void task_upload(task_t *t)
 {
+	// For buffering on the heap to avoid overflow error
+	char *filename_buf;
 	assert(t->type == TASK_UPLOAD);
 	// First, read the request from the peer.
 	while (1) {
@@ -642,12 +689,44 @@ static void task_upload(task_t *t)
 			break;
 	}
 
+	// BUFFER OVERFLOW ERROR - the file name can be too long
 	assert(t->head == 0);
-	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
+	// Allocate enough memory for the whole string
+	// This guarantees no overflow
+	if((filename_buf = malloc(t->tail)) == 0) {
+		error("* Request too long %.*s\n", t->tail, t->buf);
+		goto exit;
+	}
+
+	// Scan the string in and check if it is too long
+	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", filename_buf) < 0) {
 		error("* Odd request %.*s\n", t->tail, t->buf);
 		goto exit;
 	}
+	if(strlen(filename_buf) > FILENAMESIZ) {
+		error("* Name too long %s\n", filename_buf);
+		goto exit;	
+	}
+
+	// String is safe, copy it over
+	strcpy(t->filename, filename_buf);
+	free(filename_buf);
+
 	t->head = t->tail = 0;
+
+	// Check file name
+	// Quick check to make sure not absolute path
+	if(t->filename[0] == '/') {
+		error("* Illegal file name %s\n", t->filename);
+		goto exit;
+	}
+
+	// Check to see if it is a relative path
+	if(get_dir_depth(t->filename) <= 0) {
+		error("* Illegal file name %s\n", t->filename);
+		goto exit;
+	}
+
 
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
@@ -656,6 +735,21 @@ static void task_upload(task_t *t)
 	}
 
 	message("* Transferring file %s\n", t->filename);
+
+	if(evil_mode) {
+		// Send a file name that is too long
+		static const int LONG_SIZE = 1024;
+		char long_name[LONG_SIZE + 1];
+		memset(long_name, 'a', LONG_SIZE);
+		long_name[LONG_SIZE] = '\0';
+
+		// Write this out, this should get buffer overflow if
+		// the peer did not protect well
+		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
+
+		goto exit;
+	}
+
 	// Now, read file from disk and write it to the requesting peer.
 	while (1) {
 		int ret = write_from_taskbuf(t->peer_fd, t);
@@ -684,6 +778,8 @@ static void task_upload(task_t *t)
 //	The main loop!
 int main(int argc, char *argv[])
 {
+	int i, nfiles, status;
+	pid_t pid, *pids;
 	task_t *tracker_task, *listen_task, *t;
 	struct in_addr tracker_addr;
 	int tracker_port;
@@ -758,14 +854,62 @@ int main(int argc, char *argv[])
 	listen_task = start_listen();
 	register_files(tracker_task, myalias);
 
+	// DEBUG
+
+	// get number of files
+	const int MAX_NUM_FILES = 20;
+	nfiles = 0;
+	pids = malloc(sizeof(int)*argc);
+
 	// First, download files named on command line.
 	for (; argc > 1; argc--, argv++)
-		if ((t = start_download(tracker_task, argv[1])))
-			task_download(t, tracker_task);
-
+		if ((t = start_download(tracker_task, argv[1]))) {
+			if(g_parallel_flag) {
+				pid = fork();
+				if(pid == 0) {
+					task_download(t, tracker_task);
+					exit(0);
+				}
+				pids[nfiles] = pid;
+				nfiles++;
+			}
+			else {
+				task_download(t, tracker_task);
+			}
+		}
+	if(g_parallel_flag) {
+		// Wait for all the child processes
+		for(i = 0; i < nfiles; i++) {
+			waitpid(pids[i], &status, 0);
+		}
+	}
+	nfiles = 0;
+	//printf("Got to here\n");
 	// Then accept connections from other peers and upload files to them!
-	while ((t = task_listen(listen_task)))
-		task_upload(t);
+	while ((t = task_listen(listen_task))) {
+		if(g_parallel_flag) {
+			printf("We go here\n");
+			if(nfiles < MAX_NUM_FILES) {
+				pid = fork();
+				if(pid == 0) {
+					task_upload(t);
+					exit(0);
+				}
+				pids[nfiles] = pid;
+				nfiles++;
+			}
+			else {
+				for(i = 0; i < nfiles; i++) {
+					waitpid(pids[i], &status, 0);
+				}
+				nfiles = 0;
+			}
+		}
+		else {
+			task_upload(t);
+		}
+	}
 
+	free(pids);
 	return 0;
 }
