@@ -29,6 +29,10 @@ int evil_mode;			// nonzero iff this peer should behave badly
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
 
+static const int g_parallel_flag = 1;
+static const int MAX_NUM_FILES = 20;
+static const unsigned int MAX_SIZE = 1024*1024*2; // 2 MiB max
+
 // Helper functions
 int
 get_dir_depth(char *path)
@@ -612,6 +616,12 @@ static void task_download(task_t *t, task_t *tracker_task)
 			error("* Disk write error");
 			goto try_again;
 		}
+
+		// Sanity check on how many bytes we can do
+		if(t->total_written > MAX_SIZE) {
+			error("* File too large %d", t->filename);
+			goto try_again;
+		}
 	}
 
 	// Empty files are usually a symptom of some error.
@@ -668,7 +678,6 @@ static task_t *task_listen(task_t *listen_task)
 
 
 
-int g_parallel_flag = 0;
 // task_upload(t)
 //	Handles an upload request from another peer.
 //	First reads the request into the task buffer, then serves the peer
@@ -704,7 +713,7 @@ static void task_upload(task_t *t)
 		goto exit;
 	}
 	if(strlen(filename_buf) > FILENAMESIZ) {
-		error("* Name too long %s\n", filename_buf);
+		error("* Name too long\n");
 		goto exit;	
 	}
 
@@ -738,13 +747,14 @@ static void task_upload(task_t *t)
 
 	if(evil_mode) {
 		// Send a file name that is too long
-		static const int LONG_SIZE = 1024;
+		// Max size you can send: TASKBUFSIZ - strlen("GET ") - strlen(" OSP2P\n");
+		static const int LONG_SIZE = TASKBUFSIZ - 4 - 7;
 		char long_name[LONG_SIZE + 1];
-		memset(long_name, 'a', LONG_SIZE);
+		memset(long_name, 'e', LONG_SIZE); // e for evil!
 		long_name[LONG_SIZE] = '\0';
 
 		// Write this out, this should get buffer overflow if
-		// the peer did not protect well
+		// the peer did not protect
 		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
 
 		goto exit;
@@ -857,9 +867,9 @@ int main(int argc, char *argv[])
 	// DEBUG
 
 	// get number of files
-	const int MAX_NUM_FILES = 20;
+	nfiles = argc > MAX_NUM_FILES ? argc : MAX_NUM_FILES;
+	pids = malloc(sizeof(int)*nfiles);
 	nfiles = 0;
-	pids = malloc(sizeof(int)*argc);
 
 	// First, download files named on command line.
 	for (; argc > 1; argc--, argv++)
@@ -884,17 +894,18 @@ int main(int argc, char *argv[])
 		}
 	}
 	nfiles = 0;
-	//printf("Got to here\n");
+
 	// Then accept connections from other peers and upload files to them!
 	while ((t = task_listen(listen_task))) {
 		if(g_parallel_flag) {
-			printf("We go here\n");
 			if(nfiles < MAX_NUM_FILES) {
 				pid = fork();
 				if(pid == 0) {
 					task_upload(t);
 					exit(0);
 				}
+				// Free task, parent does not need it anymore
+				task_free(t);
 				pids[nfiles] = pid;
 				nfiles++;
 			}
