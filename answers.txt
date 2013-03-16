@@ -47,6 +47,12 @@ Also, the original code did not check how large the files got. They only made
 sure that not too much was written at once. So I had a cap the size of the
 download before it canceled.
 
+Another thing was if there were too many peers, the bounded buffer ran out
+of space. So I used a dynamic buffer so that they could read all the message
+from the tracker even if it sends a large message.
+
+
+
 # EXERCISE 3: Describe the attacks you implemented for "evil mode".  Why
 #    are they attacks?  (~3-10 sentences each)
 

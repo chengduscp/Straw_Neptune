@@ -23,6 +23,8 @@
 #include "md5.h"
 #include "osp2p.h"
 #include <sys/wait.h>
+#include <sys/time.h>
+
 
 int evil_mode;			// nonzero iff this peer should behave badly
 
@@ -110,6 +112,10 @@ typedef struct task {
 	size_t total_written;	// Total number of bytes written
 				// by write_to_taskbuf
 
+	// Dynamic array for large peer lists from tracker
+	unsigned msg_capacity;
+	char *tracker_msg;
+
 	char filename[FILENAMESIZ];	// Requested filename
 	char disk_filename[FILENAMESIZ]; // Local filename (TASK_DOWNLOAD)
 
@@ -178,6 +184,9 @@ static void task_free(task_t *t)
 		do {
 			task_pop_peer(t);
 		} while (t->peer_list);
+		if(t->tracker_msg)
+			free(t->tracker_msg);
+		t->tracker_msg = 0;
 		free(t);
 	}
 }
@@ -307,6 +316,39 @@ int open_socket(struct in_addr addr, int port)
  * at the top of this file.
  */
 
+// write_to_taskmsgbuf(t, current_msg_size)
+// Writes to dynamic buffer of t for tracker message
+//
+// Inputs:  t -- task for the tracker
+//          current_msg_size -- current number of bytes stored 
+//                              in t->tracker_msg
+// Returns: nothing
+void
+write_to_taskmsgbuf(task_t *t, unsigned *current_msg_size)
+{
+	unsigned i;
+
+	// Check if our dynamic buffer is large enough
+	if(TASKBUFSIZ < t->tail) {
+		t->tracker_msg = (char*)realloc(t->tracker_msg, 2*t->msg_capacity);
+		if(!t->tracker_msg)
+			die("tracker message too large!\n");
+		t->msg_capacity *= 2;
+	}
+
+	// Copy over to dynamic message array
+	i = *current_msg_size;
+	while(i < t->tail) {
+		t->tracker_msg[i] = t->buf[i % TASKBUFSIZ];
+		i++;
+	}
+
+	// Update the sizes
+	*current_msg_size = t->tail;
+	t->head = *current_msg_size;
+}
+
+
 // read_tracker_response(t)
 //	Reads an RPC response from the tracker using read_to_taskbuf().
 //	An example RPC response is the following:
@@ -331,23 +373,31 @@ int open_socket(struct in_addr addr, int port)
 static size_t read_tracker_response(task_t *t)
 {
 	char *s;
+	unsigned current_msg_size;
 	size_t split_pos = (size_t) -1, pos = 0;
 	t->head = t->tail = 0;
+
+	t->msg_capacity = TASKBUFSIZ;
+	t->tracker_msg = (char*)malloc(TASKBUFSIZ);
+	current_msg_size = 0;
 
 	while (1) {
 		// Check for whether buffer is complete.
 		for (; pos+3 < t->tail; pos++)
-			if ((pos == 0 || t->buf[pos-1] == '\n')
-			    && isdigit((unsigned char) t->buf[pos])
-			    && isdigit((unsigned char) t->buf[pos+1])
-			    && isdigit((unsigned char) t->buf[pos+2])) {
+			if ((pos == 0 || t->buf[(pos-1) % TASKBUFSIZ] == '\n')
+			    && isdigit((unsigned char) t->buf[(pos) % TASKBUFSIZ])
+			    && isdigit((unsigned char) t->buf[(pos+1) % TASKBUFSIZ])
+			    && isdigit((unsigned char) t->buf[(pos+2) % TASKBUFSIZ])) {
 				if (split_pos == (size_t) -1)
 					split_pos = pos;
 				if (pos + 4 >= t->tail)
 					break;
-				if (isspace((unsigned char) t->buf[pos + 3])
+				if (isspace((unsigned char) t->buf[(pos + 3) % TASKBUFSIZ])
 				    && t->buf[t->tail - 1] == '\n') {
-					t->buf[t->tail] = '\0';
+					t->buf[t->tail++] = '\0';
+
+					write_to_taskmsgbuf(t, &current_msg_size);
+
 					return split_pos;
 				}
 			}
@@ -361,6 +411,8 @@ static size_t read_tracker_response(task_t *t)
 		else if (ret == TBUF_END) {
 			die("tracker connection closed prematurely!\n");
 		}
+
+		write_to_taskmsgbuf(t, &current_msg_size);
 	}
 }
 
@@ -391,7 +443,7 @@ task_t *start_tracker(struct in_addr addr, int port)
 
 	// Collect the tracker's greeting.
 	messagepos = read_tracker_response(tracker_task);
-	message("* Tracker's greeting:\n%s", &tracker_task->buf[messagepos]);
+	message("* Tracker's greeting:\n%s", &tracker_task->tracker_msg[messagepos]);
 
 	return tracker_task;
 }
@@ -527,15 +579,17 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 	strcpy(t->filename, filename);
 
 	// add peers
-	s1 = tracker_task->buf;
-	while ((s2 = memchr(s1, '\n', (tracker_task->buf + messagepos) - s1))) {
-		if (!(p = parse_peer(s1, s2 - s1)))
+	s1 = tracker_task->tracker_msg;
+	while ((s2 = memchr(s1, '\n', (tracker_task->tracker_msg + messagepos) - s1))) {
+		p = parse_peer(s1, s2 - s1);
+		if (!(p)) {
 			die("osptracker responded to WANT command with unexpected format!\n");
+		}
 		p->next = t->peer_list;
 		t->peer_list = p;
 		s1 = s2 + 1;
 	}
-	if (s1 != tracker_task->buf + messagepos)
+	if (s1 != tracker_task->tracker_msg + messagepos)
 		die("osptracker's response to WANT has unexpected format!\n");
 
  exit:
@@ -574,6 +628,10 @@ static void task_download(task_t *t, task_t *tracker_task)
 		goto try_again;
 	}
 
+	// Make sure we don't wait forever.
+	//select(1, &t->peer_fd, 0,
+	//	fd_set *exceptfds, struct timeval *timeout);
+
 	// Attack the peer if we are evil
 	if(evil_mode) {
 		// Send a file name that is too long
@@ -585,7 +643,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 
 		// Write this out, this should get buffer overflow if
 		// the peer did not protect
-		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
+		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", long_name);
 
 		goto try_again;
 	}
