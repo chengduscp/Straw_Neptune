@@ -18,38 +18,47 @@ Student ID: 503888079
 Email: chengduscp@ucla.edu
 
 # Partner 2 (if you're working in a team)
-Name: Andy Huange
+Name: Andy Huang
 Student ID: 503885009
 Email: andy.huang0692@gmail.com
 
 # EXERCISE 1: What method you used to make your peer download and upload
 #    files in parallel?  (~1-3 sentences)
-We used forking off processes, first doing all the downloads then doing all
-the uploads
+
+We used forking off processes, one for each task. We first do all the
+downloads then do all the uploads.
 
 # EXERCISE 2A: What conditions did you find and fix that would have
 #    triggered a buffer overrun bug?  (~1-3 sentences each)
+
 If a peer sent a filename that was way too long, like 4 kilobytes, so the peer's 
 would crash with a segmentation fault. So I used a dynamically allocated array
 to make sure that the file name was never too long.
 
 # EXERCISE 2B: What other robustness problems did you fix?  (~1-3 sentences
 #    each)
+
 In the original code, there was no tracking for where the file went, so a 
 hostile peer could get files not in the peers working directory. So now it
 parses the file string and make sure it never goes anywhere above the working
 directory of the peer.
+
 Also, the original code did not check how large the files got. They only made
-sure that not too much was written at once. So 
+sure that not too much was written at once. So I had a cap the size of the
+download before it canceled.
 
 # EXERCISE 3: Describe the attacks you implemented for "evil mode".  Why
 #    are they attacks?  (~3-10 sentences each)
+
 I made one based on the buffer overflow example given above. When a peer tries
 to upload from me, I send a message back instead of the file. The message was
-a request for a file, but the request was 4 kilobytes long. If the peer did not
-do buffer overflow correctly they would segfault. This would be a denial of 
-service attack.
-I also
+a request for a file, but the request was 4 kilobytes long. If the peer did
+not do buffer overflow correctly they would segfault, disabling the peer.
+
+I also made an attack that kept sending bytes over the stream if a peer tries
+to upload from our peer. This would keep writing to its disk and if left 
+unchecked would eventually hog its resources. This also uses resources that
+could be used for actual legitimage peers. This is a denial of service attack.
 
 
 # Extra credit problems

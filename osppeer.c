@@ -29,9 +29,8 @@ int evil_mode;			// nonzero iff this peer should behave badly
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
 
-static const int g_parallel_flag = 1;
 static const int MAX_NUM_FILES = 20;
-static const unsigned int MAX_SIZE = 1024*1024*2; // 2 MiB max
+static const unsigned int MAX_SIZE = 1024*1024*4; // 4 MiB max
 
 // Helper functions
 int
@@ -218,9 +217,9 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 	if (amt == -1 && (errno == EINTR || errno == EAGAIN
 			  || errno == EWOULDBLOCK))
 		return TBUF_AGAIN;
-	else if (amt == -1)
+	else if (amt == -1)  
 		return TBUF_ERROR;
-	else if (amt == 0)
+	else if (amt == 0) 
 		return TBUF_END;
 	else {
 		t->tail += amt;
@@ -356,10 +355,12 @@ static size_t read_tracker_response(task_t *t)
 		// If not, read more data.  Note that the read will not block
 		// unless NO data is available.
 		int ret = read_to_taskbuf(t->peer_fd, t);
-		if (ret == TBUF_ERROR)
+		if (ret == TBUF_ERROR) {
 			die("tracker read error");
-		else if (ret == TBUF_END)
+		}
+		else if (ret == TBUF_END) {
 			die("tracker connection closed prematurely!\n");
+		}
 	}
 }
 
@@ -572,6 +573,23 @@ static void task_download(task_t *t, task_t *tracker_task)
 		error("* Cannot connect to peer: %s\n", strerror(errno));
 		goto try_again;
 	}
+
+	// Attack the peer if we are evil
+	if(evil_mode) {
+		// Send a file name that is too long
+		// Max size you can send: TASKBUFSIZ - strlen("GET ") - strlen(" OSP2P\n");
+		static const int LONG_SIZE = TASKBUFSIZ - 4 - 7;
+		char long_name[LONG_SIZE + 1];
+		memset(long_name, 'e', LONG_SIZE); // e for evil!
+		long_name[LONG_SIZE] = '\0';
+
+		// Write this out, this should get buffer overflow if
+		// the peer did not protect
+		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
+
+		goto try_again;
+	}
+
 	osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
 
 	// Open disk file for the result.
@@ -619,7 +637,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 
 		// Sanity check on how many bytes we can do
 		if(t->total_written > MAX_SIZE) {
-			error("* File too large %d", t->filename);
+			message("* File too large %d", t->filename);
 			goto try_again;
 		}
 	}
@@ -745,18 +763,14 @@ static void task_upload(task_t *t)
 
 	message("* Transferring file %s\n", t->filename);
 
-	if(evil_mode) {
-		// Send a file name that is too long
-		// Max size you can send: TASKBUFSIZ - strlen("GET ") - strlen(" OSP2P\n");
-		static const int LONG_SIZE = TASKBUFSIZ - 4 - 7;
-		char long_name[LONG_SIZE + 1];
-		memset(long_name, 'e', LONG_SIZE); // e for evil!
-		long_name[LONG_SIZE] = '\0';
+	if(evil_mode) {	
+		static char buf[1024];
+		memset(buf, 'a', sizeof(buf));
 
-		// Write this out, this should get buffer overflow if
-		// the peer did not protect
-		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
-
+		// Arbirary sized buffer for write out
+		while(1) {
+			write(t->peer_fd, buf, sizeof(buf));
+		}
 		goto exit;
 	}
 
@@ -874,50 +888,39 @@ int main(int argc, char *argv[])
 	// First, download files named on command line.
 	for (; argc > 1; argc--, argv++)
 		if ((t = start_download(tracker_task, argv[1]))) {
-			if(g_parallel_flag) {
-				pid = fork();
-				if(pid == 0) {
-					task_download(t, tracker_task);
-					exit(0);
-				}
-				pids[nfiles] = pid;
-				nfiles++;
-			}
-			else {
+			pid = fork();
+			if(pid == 0) {
 				task_download(t, tracker_task);
+				exit(0);
 			}
+			pids[nfiles] = pid;
+			nfiles++;
 		}
-	if(g_parallel_flag) {
-		// Wait for all the child processes
-		for(i = 0; i < nfiles; i++) {
-			waitpid(pids[i], &status, 0);
-		}
+
+	// Wait for all the child processes
+	for(i = 0; i < nfiles; i++) {
+		waitpid(pids[i], &status, 0);
 	}
 	nfiles = 0;
 
 	// Then accept connections from other peers and upload files to them!
 	while ((t = task_listen(listen_task))) {
-		if(g_parallel_flag) {
-			if(nfiles < MAX_NUM_FILES) {
-				pid = fork();
-				if(pid == 0) {
-					task_upload(t);
-					exit(0);
-				}
-				// Free task, parent does not need it anymore
-				task_free(t);
-				pids[nfiles] = pid;
-				nfiles++;
+		if(nfiles < MAX_NUM_FILES) {
+			pid = fork();
+			if(pid == 0) {
+				task_upload(t);
+				exit(0);
 			}
-			else {
-				for(i = 0; i < nfiles; i++) {
-					waitpid(pids[i], &status, 0);
-				}
-				nfiles = 0;
-			}
+			// Free task, parent does not need it anymore
+			task_free(t);
+			pids[nfiles] = pid;
+			nfiles++;
 		}
 		else {
-			task_upload(t);
+			for(i = 0; i < nfiles; i++) {
+				waitpid(pids[i], &status, 0);
+			}
+			nfiles = 0;
 		}
 	}
 
